@@ -106,6 +106,11 @@ const ROOM_TEMPLATES = [
   },
 ];
 
+const TEMPLATE_BY_TYPE = ROOM_TEMPLATES.reduce((acc, t) => {
+  acc[t.type.toLowerCase()] = t;
+  return acc;
+}, {});
+
 const CITIES = [
   "Bangkok",
   "Pattaya",
@@ -184,10 +189,87 @@ export default function HotelBookingTemplate() {
 
   const navigate = useNavigate();
 
-  const [results, setResults] = React.useState([]); 
+  const [results, setResults] = React.useState([]);
   const [selected, setSelected] = React.useState(null);
+  const [availableRooms, setAvailableRooms] = React.useState([]);
 
-  // Checkout dialog state
+  useEffect(() => {
+    const loadRoomsFromDB = async () => {
+      try {
+        const res = await fetch(`${API_URL}/rooms`);
+        const data = await res.json();
+
+        console.log("Rooms from DB raw:", data);
+
+        if (res.ok && data.status === "ok") {
+          const enriched = (data.rooms || []).map((r) => {
+            const rawType = (r.room_type || r.type || "").toString().trim();
+            const rawTypeLower = rawType.toLowerCase();
+
+            let typeKey = "";
+            if (rawTypeLower.includes("presidential")) typeKey = "presidential";
+            else if (rawTypeLower.includes("family")) typeKey = "family";
+            else if (rawTypeLower.includes("deluxe")) typeKey = "deluxe";
+            else if (rawTypeLower.includes("suite")) typeKey = "suite";
+            else if (rawTypeLower.includes("standard")) typeKey = "standard";
+            else typeKey = rawTypeLower;
+
+            const template = TEMPLATE_BY_TYPE[typeKey] || null;
+
+            const imageByType = {
+              standard: "/images/hotel-std.jpg",
+              deluxe: "/images/hotel-dlx.jpg",
+              suite: "/images/hotel-ste.jpg",
+              family: "/images/hotel-fam.jpg",
+              presidential: "/images/hotel-ste.jpg",
+            };
+
+            const displayName =
+              template?.name ||
+              rawType ||
+              `Room ${r.room_number || r.id}`;
+
+            const priceFromDB = Number(
+              r.price_per_night ?? r.pricePerNight ?? r.price_perNight
+            );
+
+            const pricePerNight =
+              !Number.isNaN(priceFromDB) && priceFromDB > 0
+                ? priceFromDB
+                : template?.pricePerNight || 0;
+
+            return {
+              id: r.id,
+              roomId: r.id,
+              roomNumber: r.room_number || r.name || r.id,
+              name: displayName,
+              type: template?.type || rawType || "Room",
+              city: r.city,
+              pricePerNight,
+              guests: template?.guests ?? 2,
+              beds: template?.beds ?? 1,
+              amenities: template?.amenities ?? [],
+              image: template?.image || imageByType[typeKey] || "/images/hotel-std.jpg",
+              total_rooms: r.total_rooms ?? r.totalRooms ?? 1,
+              status: r.status || "available",
+            };
+          });
+
+          console.log("Rooms enriched:", enriched);
+          setAvailableRooms(enriched);
+        } else {
+          setAvailableRooms([]);
+        }
+      } catch (err) {
+        console.error("Load rooms error:", err);
+        setAvailableRooms([]);
+      }
+    };
+
+    loadRoomsFromDB();
+  }, []);
+
+  // Checkout dialog
   const [checkoutData, setCheckoutData] = React.useState(null);
   const [includeBreakfast, setIncludeBreakfast] = React.useState(false);
   const BREAKFAST_PRICE = 180;
@@ -198,7 +280,7 @@ export default function HotelBookingTemplate() {
       : 0;
 
   const onSearch = (e) => {
-    e?.preventDefault?.();
+    if (e?.preventDefault) e.preventDefault();
 
     const nightsSelected =
       checkIn && checkOut ? dayjs(checkOut).diff(dayjs(checkIn), "day") : 0;
@@ -207,26 +289,77 @@ export default function HotelBookingTemplate() {
       return;
     }
 
-    let filtered = [...ROOMS];
-
-    filtered = filtered.filter((r) => r.pricePerNight <= maxBudget);
-
-    if (roomType !== "any") {
-      filtered = filtered.filter(
-        (r) => r.type.toLowerCase() === roomType.toLowerCase()
-      );
-    }
-
     const requiredGuests = adults + children;
-    filtered = filtered.filter((r) => r.guests * rooms >= requiredGuests);
-
     const q = normalize(destination);
-    if (q) {
-      filtered = filtered.filter(
-        (r) =>
-          normalize(r.city).includes(q) || normalize(r.name).includes(q)
+
+
+    const sourceRooms =
+      availableRooms && availableRooms.length > 0 ? availableRooms : ROOMS;
+
+
+    const normalizedRooms = sourceRooms.map((r) => {
+      const priceRaw =
+        r.pricePerNight !== undefined
+          ? r.pricePerNight
+          : r.price_per_night !== undefined
+            ? r.price_per_night
+            : 0;
+
+      const price = parseFloat(priceRaw) || 0;
+      const typeText = (r.type || r.room_type || "").toLowerCase();
+
+
+      const tpl =
+        TEMPLATE_BY_TYPE[typeText] ||
+        TEMPLATE_BY_TYPE[(r.room_type || "").toLowerCase()] ||
+        TEMPLATE_BY_TYPE[(r.name || "").toLowerCase()] ||
+        null;
+
+
+      const img =
+        r.image ||
+        tpl?.image ||
+        roomImage(
+          r.city || "",
+          tpl?.name || r.name || r.room_type || "Room"
+        );
+
+      return {
+        ...r,
+        image: img,
+        pricePerNight: price,
+        _typeNorm: typeText,
+        _cityNorm: normalize(r.city || ""),
+        _nameNorm: normalize(r.name || r.room_name || r.roomNumber || ""),
+        guests: r.guests ?? tpl?.guests ?? 2,
+        beds: r.beds ?? tpl?.beds ?? 1,
+        amenities: r.amenities ?? tpl?.amenities ?? [],
+      };
+    });
+
+
+    const filtered = normalizedRooms.filter((r) => {
+      const matchesBudget = r.pricePerNight <= maxBudget;
+
+      const matchesType =
+        roomType === "any" ||
+        r._typeNorm === roomType.toLowerCase() ||
+        (roomType === "presidential" &&
+          r._nameNorm.includes("presidential"));
+
+      const matchesGuests = r.guests * rooms >= requiredGuests;
+      const matchesDestination =
+        !q || r._cityNorm.includes(q) || r._nameNorm.includes(q);
+
+      return (
+        matchesBudget &&
+        matchesType &&
+        matchesGuests &&
+        matchesDestination
       );
-    }
+    });
+
+    console.log("Filtered rooms:", filtered.length, filtered);
 
     setHasSearched(true);
     setResults(filtered);
@@ -235,6 +368,7 @@ export default function HotelBookingTemplate() {
       .getElementById("results-start")
       ?.scrollIntoView({ behavior: "smooth" });
   };
+
   useEffect(() => {
     if (hasSearched)
       onSearch();
@@ -291,20 +425,27 @@ export default function HotelBookingTemplate() {
 
       const data = await res.json();
 
+      if (data.status === "full") {
+        alert("This room is fully booked for the selected dates.");
+        return null;
+      }
+
       if (!res.ok || data.status !== "ok") {
         console.error("Booking error:", data);
-        alert("Failed to save booking");
-        return;
+        alert(data.message || "Failed to save booking");
+        return null;
       }
 
       console.log("Booking saved:", data);
       return data;
+
     } catch (err) {
       console.error(err);
       alert("Failed to save booking");
       throw err;
     }
   };
+
 
   const handleConfirmPayment = async () => {
     try {
@@ -755,36 +896,37 @@ export default function HotelBookingTemplate() {
               เลือกพิมพ์ห้องที่สนใจ หรือกรอกด้านบนแล้วกด Search
               เพื่อดูห้องว่างจริง
             </Typography>
-            <Grid container spacing={3}>
+            <Grid container spacing={3} alignItems="stretch">
               {ROOM_TYPES_UNIQUE.map((t) => (
                 <Grid item xs={12} sm={6} md={4} key={t.type}>
                   <Card
-                    sx={{ borderRadius: 3, overflow: "hidden" }}
+                    sx={{
+                      borderRadius: 3,
+                      overflow: "hidden",
+                      height: "100%",
+                      display: "flex",
+                      flexDirection: "column",
+                    }}
                   >
                     <CardMedia
                       component="img"
-                      height={180}
-                      image={
-                        t.image
-                          ? t.image
-                          : roomImage("Bangkok", t.name)
-                      }
-                      alt={t.name}
+                      image={t.image}
+                      sx={{
+                        height: 200,
+                        width: "100%",
+                        objectFit: "cover",
+                      }}
                     />
-                    <CardContent>
-                      <Typography variant="h6">
-                        {t.name}
-                      </Typography>
-                      <Stack
-                        direction="row"
-                        spacing={1}
-                        sx={{ mt: 1 }}
-                      >
-                        <Chip
-                          label={t.type}
-                          size="small"
-                          color="primary"
-                        />
+                    <CardContent
+                      sx={{
+                        flexGrow: 1,
+                        display: "flex",
+                        flexDirection: "column",
+                      }}
+                    >
+                      <Typography variant="h6">{t.name}</Typography>
+                      <Stack direction="row" spacing={1} sx={{ mt: 1 }}>
+                        <Chip label={t.type} size="small" color="primary" />
                         <Chip
                           label={`Up to ${t.guests} guests`}
                           size="small"
@@ -877,84 +1019,116 @@ export default function HotelBookingTemplate() {
                   </Paper>
                 )}
 
-                {results.map((room) => (
-                  <Card key={room.id} sx={{ borderRadius: 3, overflow: "hidden" }}>
-                    <CardActionArea>
-                      <Grid container sx={{ minHeight: 170 }}>
-                        <Grid item xs={12} md={4}>
-                          <CardMedia
-                            component="img"
-                            image={room.image}
-                            alt={room.name}
-                            sx={{
-                              width: "100%",
-                              height: 180,
-                              objectFit: "cover",
-                              borderRadius: 0,
-                            }}
-                          />
-                        </Grid>
+                <Stack spacing={2}>
+                  {results.length === 0 && (
+                    <Paper sx={{ p: 3, borderRadius: 3 }}>
+                      <Typography>
+                        No rooms match your filters. Try raising the
+                        budget or changing room type.
+                      </Typography>
+                    </Paper>
+                  )}
 
-                        <Grid item xs={12} md={8}>
-                          <Box
-                            sx={{
-                              display: "flex",
-                              flexDirection: "column",
-                              height: "100%",
+                  {results.map((room) => (
+                    <Card
+                      key={room.id}
+                      sx={{
+                        borderRadius: 3,
+                        overflow: "hidden",
+                        cursor: "pointer",
+                        display: "flex",
+                      }}
+                      onClick={() => setSelected(room)}
+                    >
+                      {/* ซ้าย: รูปห้อง (กรอบเท่ากันทุกใบ) */}
+                      <Box
+                        sx={{
+                          width: 260,          // ความกว้างคอลัมน์รูป
+                          flexShrink: 0,
+                        }}
+                      >
+                        <CardMedia
+                          component="img"
+                          image={room.image}
+                          alt={room.name}
+                          sx={{
+                            width: "100%",
+                            height: 180,        // ★ กรอบรูปสูงเท่ากันทุกใบ
+                            objectFit: "cover",
+                          }}
+                        />
+                      </Box>
+
+                      {/* ขวา: เนื้อหา + ปุ่ม */}
+                      <Box
+                        sx={{
+                          flex: 1,
+                          p: 2,
+                          display: "flex",
+                          flexDirection: "column",
+                          minHeight: 180,       // ★ ให้คอลัมน์ขวาไม่น้อยกว่ารูป
+                        }}
+                      >
+                        {/* ชื่อ + subtext */}
+                        <Box>
+                          <Typography variant="h6">{room.name}</Typography>
+                          <Typography
+                            variant="body2"
+                            color="text.secondary"
+                            sx={{ mb: 1 }}
+                          >
+                            {room.type} • up to {room.guests} guests • {room.beds} bed(s) •{" "}
+                            {room.city}
+                          </Typography>
+
+                          {/* chips */}
+                          <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+                            <Chip label={room.city} color="primary" size="small" />
+                            {(room.amenities || []).map((a) => (
+                              <Chip
+                                key={a}
+                                label={a}
+                                variant="outlined"
+                                size="small"
+                              />
+                            ))}
+                          </Stack>
+                        </Box>
+
+                        {/* ดันให้ส่วนล่างไปติดขอบล่างเสมอ */}
+                        <Box sx={{ flexGrow: 1 }} />
+
+                        {/* ราคา + ปุ่ม (ตำแหน่งเท่ากันทุกรายการ) */}
+                        <Stack
+                          direction="row"
+                          alignItems="center"
+                          justifyContent="space-between"
+                          sx={{ mt: 2 }}
+                        >
+                          <Typography variant="h6">
+                            ฿
+                            {Number(
+                              room.pricePerNight ?? room.price_per_night ?? 0
+                            ).toLocaleString()}{" "}
+                            <Typography component="span" variant="caption">
+                              /night
+                            </Typography>
+                          </Typography>
+
+                          <Button
+                            variant="contained"
+                            onClick={(e) => {
+                              e.stopPropagation(); // กันไม่ให้ไป trigger onClick การ์ด
+                              setSelected(room);
                             }}
                           >
-                            <CardHeader
-                              title={room.name}
-                              subheader={`${room.type} • up to ${room.guests} guests • ${room.beds} bed(s) • ${room.city}`}
-                            />
-
-                            <CardContent
-                              sx={{
-                                display: "flex",
-                                flexDirection: "column",
-                                flexGrow: 1,
-                              }}
-                            >
-
-                              <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
-                                <Chip label={room.city} color="primary" size="small" />
-                                {room.amenities.map((a) => (
-                                  <Chip key={a} label={a} variant="outlined" size="small" />
-                                ))}
-                              </Stack>
-
-
-                              <Box sx={{ flexGrow: 1 }} />
-
-                              <Stack
-                                direction="row"
-                                alignItems="center"
-                                justifyContent="space-between"
-                                sx={{ mt: 2 }}
-                              >
-                                <Typography variant="h6">
-                                  ฿{room.pricePerNight.toLocaleString()}{" "}
-                                  <Typography component="span" variant="caption">
-                                    /night
-                                  </Typography>
-                                </Typography>
-                                <Button
-                                  variant="contained"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    setSelected(room);
-                                  }}
-                                >
-                                  Select
-                                </Button>
-                              </Stack>
-                            </CardContent>
-                          </Box>
-                        </Grid>
-                      </Grid>
-                    </CardActionArea>
-                  </Card>
-                ))}
+                            SELECT
+                          </Button>
+                        </Stack>
+                      </Box>
+                    </Card>
+                  ))}
+                </Stack>
               </Stack>
             </Grid>
           </Grid>
@@ -1001,7 +1175,7 @@ export default function HotelBookingTemplate() {
                     useFlexGap
                     sx={{ my: 1 }}
                   >
-                    {selected.amenities.map((a) => (
+                    {(selected.amenities || []).map((a) => (
                       <Chip key={a} label={a} size="small" />
                     ))}
                   </Stack>
@@ -1190,7 +1364,7 @@ export default function HotelBookingTemplate() {
                             variant="h6"
                             sx={{ mt: 1 }}
                           >
-                            Tota;p:{" "}
+                            Total:{" "}
                             <b>฿{grandTotal.toLocaleString()}</b>
                           </Typography>
                         </CardContent>
